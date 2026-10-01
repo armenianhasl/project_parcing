@@ -3,7 +3,7 @@
 Polymarket Market WS -> ClickHouse ingest (two-table mode).
 
 Goal:
-- Store initial UP orderbook snapshot once per market event in table `orderbook`.
+- Store the first UP orderbook snapshot per connection in table `orderbook`.
 - Store UP price changes as deltas in table `pricechange`.
 
 No analytics/modeling in this script.
@@ -13,31 +13,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
-import time
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urlencode, quote
-import certifi
-import urllib3
+from urllib.parse import urlencode
 import websockets
-from dotenv import load_dotenv
-
+from ingest_common import (
+    CH_DB, ch_http_command, ch_http_insert_json_each_row, http,
+    normalize_messages, now_msk_naive, to_float, to_int, websocket_messages,
+)
 
 # -------------------- Env --------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, "password.env"), override=False)
-load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
-
 WS_URL = os.getenv("POLY_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
 ORIGIN = os.getenv("POLY_WS_ORIGIN", "https://polymarket.com")
 
 POLY_TAG_ID = os.getenv("POLY_TAG_ID", "21")
 POLY_ACTIVE = os.getenv("POLY_ACTIVE", "true").lower() in ("1", "true", "yes")
 POLY_CLOSED = os.getenv("POLY_CLOSED", "false").lower() in ("1", "true", "yes")
-POLY_LIMIT = int(os.getenv("POLY_LIMIT", "200"))
+POLY_LIMIT = max(1, int(os.getenv("POLY_LIMIT", "200")))
 POLY_REFRESH_SEC = int(os.getenv("POLY_REFRESH_SEC", "60"))
 
 POLY_SYMBOLS = [s.strip().upper() for s in os.getenv("POLY_SYMBOLS", "").split(",") if s.strip()]
@@ -53,15 +49,6 @@ POLY_REQUIRE_UP_DOWN = os.getenv("POLY_REQUIRE_UP_DOWN", "true").lower() in ("1"
 POLY_TRACK_CURRENT_ONLY = os.getenv("POLY_TRACK_CURRENT_ONLY", "true").lower() in ("1", "true", "yes")
 POLY_MAX_MATCHED_MARKETS = int(os.getenv("POLY_MAX_MATCHED_MARKETS", "1"))
 POLY_DEBUG_MARKETS = os.getenv("POLY_DEBUG_MARKETS", "true").lower() in ("1", "true", "yes")
-
-CH_HOST = os.getenv("CLICKHOUSE_HOST", "89.169.153.71")
-CH_PORT = int(os.getenv("CLICKHOUSE_PORT", "8123"))
-CH_USER = os.getenv("CLICKHOUSE_USER", "remote_ingest")
-CH_PASS = os.getenv("CLICKHOUSE_PASSWORD", "")
-CH_DB = os.getenv("CLICKHOUSE_DB", "polyk")
-CH_HTTP_INTERFACE = os.getenv("CLICKHOUSE_HTTP_INTERFACE", "http")
-CH_HTTP_HOST = os.getenv("CLICKHOUSE_HTTP_HOST", CH_HOST)
-CH_HTTP_PORT = int(os.getenv("CLICKHOUSE_HTTP_PORT", str(CH_PORT)))
 
 ORDERBOOK_TABLE = os.getenv("ORDERBOOK_TABLE", "orderbook")
 PRICECHANGE_TABLE = os.getenv("PRICECHANGE_TABLE", "pricechange")
@@ -79,12 +66,6 @@ HEARTBEAT_ENABLED = os.getenv("HEARTBEAT_ENABLED", "true").lower() in ("1", "tru
 HEARTBEAT_EVERY_SEC = float(os.getenv("HEARTBEAT_EVERY_SEC", "10"))
 SERVICE_LOG_ENABLED = os.getenv("SERVICE_LOG_ENABLED", "true").lower() in ("1", "true", "yes")
 SERVICE_LOG_FLUSH_SUCCESS = os.getenv("SERVICE_LOG_FLUSH_SUCCESS", "false").lower() in ("1", "true", "yes")
-CH_INSERT_RETRIES = int(os.getenv("CH_INSERT_RETRIES", "3"))
-CH_INSERT_RETRY_BACKOFF_SEC = float(os.getenv("CH_INSERT_RETRY_BACKOFF_SEC", "0.5"))
-
-if CH_USER == "remote_ingest" and not CH_PASS:
-    raise RuntimeError("CLICKHOUSE_PASSWORD is empty. Set it in password.env or .env")
-
 POLY_MARKET_EXCLUDE_RE = None
 if POLY_MARKET_EXCLUDE_REGEX:
     try:
@@ -92,12 +73,6 @@ if POLY_MARKET_EXCLUDE_REGEX:
     except re.error:
         # Keep ingest alive even if regex in env is invalid.
         POLY_MARKET_EXCLUDE_RE = None
-
-POLY_INSECURE_SSL = os.getenv("POLY_INSECURE_SSL", "false").lower() in ("1", "true", "yes")
-_http = urllib3.PoolManager(
-    cert_reqs="CERT_NONE" if POLY_INSECURE_SSL else "CERT_REQUIRED",
-    ca_certs=None if POLY_INSECURE_SSL else certifi.where(),
-)
 
 if ORDERBOOK_GRID_STEP <= 0:
     raise RuntimeError("ORDERBOOK_GRID_STEP must be > 0")
@@ -120,20 +95,6 @@ CURRENT_ASSET_IDS: List[str] = []
 OUTCOME_MAP: Dict[str, str] = {}  # asset_id -> UP/DOWN
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _fmt_dt_msk(dt: Optional[datetime]) -> str:
-    if not dt:
-        return ""
-    if dt.tzinfo is None:
-        dt_utc = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt_utc = dt.astimezone(timezone.utc)
-    return (dt_utc + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
-
-
 def _pick_first_up_asset_id(asset_ids: List[str], outcome_map: Dict[str, str]) -> str:
     for aid in asset_ids:
         label = str(outcome_map.get(aid, "")).strip().lower()
@@ -142,45 +103,8 @@ def _pick_first_up_asset_id(asset_ids: List[str], outcome_map: Dict[str, str]) -
     return asset_ids[0] if asset_ids else ""
 
 
-def now_msk_naive() -> datetime:
-    # Keep ingest_time directly in Moscow wall-clock time for easier Jupyter usage.
-    return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(tzinfo=None)
-
-
-def to_int(x: Any, default: int = 0) -> int:
-    try:
-        if x is None:
-            return default
-        if isinstance(x, (int, float)):
-            return int(x)
-        if isinstance(x, str) and x.strip():
-            return int(float(x.strip()))
-    except Exception:
-        pass
-    return default
-
-
-def to_float(x: Any, default: float = 0.0) -> float:
-    try:
-        if x is None:
-            return default
-        if isinstance(x, (int, float)):
-            return float(x)
-        if isinstance(x, str) and x.strip():
-            s = x.strip().replace(" ", "")
-            # Handle both "20,767.81" and "20767,81"
-            if "," in s and "." in s:
-                s = s.replace(",", "")
-            elif "," in s and "." not in s:
-                s = s.replace(",", ".")
-            return float(s)
-    except Exception:
-        pass
-    return default
-
-
 def price_to_tick(price: float) -> Optional[int]:
-    if price < ORDERBOOK_GRID_MIN - 1e-12 or price > ORDERBOOK_GRID_MAX + 1e-12:
+    if not math.isfinite(price) or price < ORDERBOOK_GRID_MIN - 1e-12 or price > ORDERBOOK_GRID_MAX + 1e-12:
         return None
     tick = int(round((price - ORDERBOOK_GRID_MIN) / ORDERBOOK_GRID_STEP))
     if tick < 0 or tick > GRID_TICKS_COUNT:
@@ -190,24 +114,6 @@ def price_to_tick(price: float) -> Optional[int]:
 
 def tick_to_price(tick: int) -> float:
     return round(ORDERBOOK_GRID_MIN + tick * ORDERBOOK_GRID_STEP, 6)
-
-
-def normalize_messages(raw: Union[Dict[str, Any], List[Any]]) -> List[Dict[str, Any]]:
-    if isinstance(raw, dict):
-        return [raw]
-    if isinstance(raw, list):
-        out: List[Dict[str, Any]] = []
-        for x in raw:
-            if isinstance(x, dict):
-                out.append(x)
-            elif isinstance(x, list):
-                out.extend([y for y in x if isinstance(y, dict)])
-        return out
-    return []
-
-
-def outcome_from_asset_id(asset_id: str) -> str:
-    return OUTCOME_MAP.get(str(asset_id), "")
 
 
 def is_up_asset(asset_id: str) -> bool:
@@ -227,7 +133,6 @@ def is_orderbook(msg: Dict[str, Any]) -> bool:
     if not has_core:
         return False
     return ("bids" in msg and "asks" in msg) or ("buys" in msg and "sells" in msg)
-
 
 
 def is_price_change(msg: Dict[str, Any]) -> bool:
@@ -267,7 +172,7 @@ def extract_book_level_sizes(msg: Dict[str, Any]) -> Tuple[Dict[int, float], Dic
             tick = price_to_tick(p)
             if tick is None:
                 continue
-            if s <= 0:
+            if not math.isfinite(s) or s <= 0:
                 continue
             bid_sizes_by_tick[tick] = bid_sizes_by_tick.get(tick, 0.0) + s
 
@@ -280,7 +185,7 @@ def extract_book_level_sizes(msg: Dict[str, Any]) -> Tuple[Dict[int, float], Dic
             tick = price_to_tick(p)
             if tick is None:
                 continue
-            if s <= 0:
+            if not math.isfinite(s) or s <= 0:
                 continue
             ask_sizes_by_tick[tick] = ask_sizes_by_tick.get(tick, 0.0) + s
 
@@ -399,7 +304,9 @@ def build_pricechange_rows(
         if tick is None:
             continue
 
-        new_size = to_float(pc.get("size"))
+        new_size = to_float(pc.get("size"), default=float("nan"))
+        if not math.isfinite(new_size) or new_size < 0:
+            continue
         price = tick_to_price(tick)
         event_hash = str(pc.get("hash", "") or msg.get("hash", ""))
         state_key = f"{market}|{asset_id}|{side}|{tick}"
@@ -430,9 +337,11 @@ def build_pricechange_rows(
 
 
 # -------------------- Gamma discovery --------------------
-def build_gamma_markets_url(offset: int = 0) -> str:
-    base = "https://gamma-api.polymarket.com/markets"
-    params = {"tag_id": POLY_TAG_ID, "limit": POLY_LIMIT, "offset": offset}
+def build_gamma_markets_url(cursor: Optional[str] = None) -> str:
+    base = "https://gamma-api.polymarket.com/markets/keyset"
+    params = {"tag_id": POLY_TAG_ID, "limit": POLY_LIMIT}
+    if cursor:
+        params["after_cursor"] = cursor
     if POLY_ACTIVE:
         params["active"] = "true"
     if not POLY_CLOSED:
@@ -441,7 +350,7 @@ def build_gamma_markets_url(offset: int = 0) -> str:
 
 
 def http_get_json(url: str) -> Any:
-    resp = _http.request(
+    resp = http.request(
         "GET",
         url,
         headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
@@ -489,6 +398,11 @@ def _extract_clob_token_ids(m: Dict[str, Any]) -> List[str]:
 
 def _extract_outcomes(m: Dict[str, Any]) -> List[str]:
     v = m.get("outcomes")
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except (TypeError, ValueError):
+            return []
     if isinstance(v, list):
         return [str(x) for x in v]
     return []
@@ -573,12 +487,6 @@ def _market_sort_key_for_current(m: Dict[str, Any], now_ts: float) -> Tuple[int,
     return (1, end_ts, str(m.get("slug") or m.get("id") or ""))
 
 
-def _refresh_sleep_seconds(runtime_state: Dict[str, Any], *, no_markets: bool = False) -> float:
-    _ = runtime_state
-    _ = no_markets
-    return max(1.0, float(POLY_REFRESH_SEC))
-
-
 def _has_up_down_intent(m: Dict[str, Any], text_l: str) -> bool:
     slug = str(m.get("slug") or "").lower()
     if "up-or-down" in slug:
@@ -656,12 +564,16 @@ def _select_current_markets_by_symbol(matched: List[Dict[str, Any]]) -> List[Dic
     if not POLY_SYMBOLS:
         selected = sorted(matched, key=lambda m: _market_sort_key_for_current(m, now_ts))
     else:
+        by_symbol = {symbol: [] for symbol in POLY_SYMBOLS}
+        for market in matched:
+            for symbol in _infer_market_symbols(market):
+                by_symbol[symbol].append(market)
         for sym in POLY_SYMBOLS:
-            sym_markets = [m for m in matched if sym in _infer_market_symbols(m)]
+            sym_markets = by_symbol[sym]
             if not sym_markets:
                 continue
 
-            best = sorted(sym_markets, key=lambda m: _market_sort_key_for_current(m, now_ts))[0]
+            best = min(sym_markets, key=lambda m: _market_sort_key_for_current(m, now_ts))
             market_key = _extract_market_id(best) or str(id(best))
             if market_key in selected_ids:
                 continue
@@ -727,18 +639,21 @@ def market_passes_filters(m: Dict[str, Any]) -> bool:
 
 
 def fetch_filtered_markets() -> List[Dict[str, Any]]:
-    all_markets: List[Dict[str, Any]] = []
-    offset = 0
+    matched: List[Dict[str, Any]] = []
+    cursor = None
+    seen_cursors = set()
     while True:
-        payload = http_get_json(build_gamma_markets_url(offset))
+        payload = http_get_json(build_gamma_markets_url(cursor))
+        if not isinstance(payload, dict) or not isinstance(payload.get("markets"), list):
+            raise RuntimeError("Unexpected Gamma markets/keyset response")
         page = _gamma_payload_to_markets(payload)
-        if not page:
+        matched.extend(m for m in page if market_passes_filters(m))
+        cursor = payload.get("next_cursor")
+        if not cursor:
             break
-        all_markets.extend(page)
-        if len(page) < POLY_LIMIT:
-            break
-        offset += POLY_LIMIT
-    matched = [m for m in all_markets if market_passes_filters(m)]
+        if cursor in seen_cursors:
+            raise RuntimeError("Gamma pagination returned a repeated cursor")
+        seen_cursors.add(cursor)
 
     # If a strict whitelist is set, keep all matched whitelist markets as-is.
     if POLY_MARKET_WHITELIST_IDS:
@@ -783,14 +698,11 @@ def build_outcome_map(markets: List[Dict[str, Any]]) -> Tuple[List[str], Dict[st
 
 async def refresh_markets_loop(reload_event: asyncio.Event, runtime_state: Dict[str, Any]) -> None:
     global CURRENT_ASSET_IDS, OUTCOME_MAP
-    last_sig: Optional[str] = None
+    last_sig = json.dumps({"assets": sorted(set(CURRENT_ASSET_IDS))}, sort_keys=True)
 
     while True:
-        load_dotenv(os.path.join(BASE_DIR, "password.env"), override=False)
-        load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
-
         try:
-            markets = fetch_filtered_markets()
+            markets = await asyncio.to_thread(fetch_filtered_markets)
             if not markets:
                 print("[REFRESH] no markets matched filters")
                 runtime_state["tracked_markets"] = 0
@@ -800,8 +712,8 @@ async def refresh_markets_loop(reload_event: asyncio.Event, runtime_state: Dict[
                 runtime_state["current_market_end_ts"] = 0
                 runtime_state["status"] = "no_markets"
                 runtime_state["last_error"] = ""
-                service_log("WARN", "refresh_no_markets", status="no_markets")
-                await asyncio.sleep(_refresh_sleep_seconds(runtime_state, no_markets=True))
+                await service_log("WARN", "refresh_no_markets", status="no_markets")
+                await asyncio.sleep(max(1.0, POLY_REFRESH_SEC))
                 continue
 
             asset_ids, outcome_map = build_outcome_map(markets)
@@ -816,6 +728,8 @@ async def refresh_markets_loop(reload_event: asyncio.Event, runtime_state: Dict[
             if sig != last_sig:
                 CURRENT_ASSET_IDS = asset_ids
                 OUTCOME_MAP = outcome_map
+                reload_event.set()
+                last_sig = sig
                 print(f"[REFRESH] markets={len(markets)} assets={len(asset_ids)}")
                 if markets:
                     print(f"[REFRESH] selected { _market_debug_label(markets[0]) }")
@@ -824,7 +738,7 @@ async def refresh_markets_loop(reload_event: asyncio.Event, runtime_state: Dict[
                     print(f"[REFRESH] symbol_counts={dbg['symbol_counts']}")
                     for sample in dbg["samples"]:
                         print(f"[REFRESH] sample symbols={sample['symbols']} {sample['label']}")
-                service_log(
+                await service_log(
                     "INFO",
                     "refresh_selection_changed",
                     status=str(runtime_state.get("status") or ""),
@@ -834,97 +748,23 @@ async def refresh_markets_loop(reload_event: asyncio.Event, runtime_state: Dict[
                         "markets": len(markets),
                         "assets": len(asset_ids),
                         "market_end_ts": runtime_state.get("current_market_end_ts") or 0,
-                        "next_refresh_sec": round(_refresh_sleep_seconds(runtime_state), 3),
+                        "next_refresh_sec": round(max(1.0, POLY_REFRESH_SEC), 3),
                     },
                 )
-                reload_event.set()
-                last_sig = sig
 
         except Exception as e:
             print("[REFRESH] error:", repr(e))
             runtime_state["last_error"] = repr(e)
             runtime_state["status"] = "refresh_error"
-            service_log("ERROR", "refresh_error", status="refresh_error", error_text=repr(e))
+            await service_log("ERROR", "refresh_error", status="refresh_error", error_text=repr(e))
 
-        await asyncio.sleep(_refresh_sleep_seconds(runtime_state))
+        await asyncio.sleep(max(1.0, POLY_REFRESH_SEC))
 
 
 # -------------------- ClickHouse I/O --------------------
-def ch_http_command(sql: str) -> None:
-    params = {
-        "database": CH_DB,
-        "query": sql,
-        "user": CH_USER,
-        "password": CH_PASS,
-    }
-    url = f"{CH_HTTP_INTERFACE}://{CH_HTTP_HOST}:{CH_HTTP_PORT}/?" + urlencode(params, quote_via=quote)
-    resp = _http.request(
-        "POST",
-        url,
-        body=b"",
-        headers={"Content-Type": "text/plain"},
-        timeout=30.0,
-        retries=False,
-    )
-    if resp.status >= 300:
-        raise RuntimeError(f"HTTP COMMAND failed {resp.status}: {resp.data.decode('utf-8', errors='replace')}")
 
 
-def ch_http_insert_json_each_row(table: str, columns: List[str], rows: List[Tuple]) -> None:
-    if not rows:
-        return
-
-    dict_rows: List[Dict[str, Any]] = []
-    for r in rows:
-        d = {columns[i]: r[i] for i in range(len(columns))}
-        for k, v in list(d.items()):
-            if isinstance(v, datetime):
-                d[k] = v.strftime("%Y-%m-%d %H:%M:%S")
-        dict_rows.append(d)
-
-    body = "\n".join(json.dumps(d, ensure_ascii=False, separators=(",", ":")) for d in dict_rows) + "\n"
-    insert_sql = f"INSERT INTO {table} ({', '.join(columns)}) FORMAT JSONEachRow"
-
-    params = {
-        "database": CH_DB,
-        "query": insert_sql,
-        "user": CH_USER,
-        "password": CH_PASS,
-    }
-    url = f"{CH_HTTP_INTERFACE}://{CH_HTTP_HOST}:{CH_HTTP_PORT}/?" + urlencode(params, quote_via=quote)
-    attempts = max(1, CH_INSERT_RETRIES)
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, attempts + 1):
-        try:
-            resp = _http.request(
-                "POST",
-                url,
-                body=body.encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                timeout=30.0,
-                retries=False,
-            )
-            if resp.status >= 300:
-                raise RuntimeError(
-                    f"HTTP INSERT failed {resp.status}: {resp.data.decode('utf-8', errors='replace')}"
-                )
-            return
-        except Exception as e:
-            last_exc = e
-            if attempt >= attempts:
-                break
-            sleep_sec = max(0.0, CH_INSERT_RETRY_BACKOFF_SEC) * attempt
-            if sleep_sec > 0:
-                time.sleep(sleep_sec)
-    if last_exc is not None:
-        raise last_exc
-
-
-def ch_http_insert_one_row(table: str, columns: List[str], row: Tuple) -> None:
-    ch_http_insert_json_each_row(table, columns, [row])
-
-
-def service_log(
+async def service_log(
     level: str,
     event: str,
     *,
@@ -968,19 +808,19 @@ def service_log(
             "details",
             "error_text",
         ]
-        ch_http_insert_one_row(f"{CH_DB}.{INGEST_SERVICE_LOG_TABLE}", cols, row)
+        await asyncio.to_thread(ch_http_insert_json_each_row, f"{CH_DB}.{INGEST_SERVICE_LOG_TABLE}", cols, [row])
     except Exception as e:
         print("[SERVICE_LOG] insert error:", repr(e))
 
 
-def heartbeat_write(runtime_state: Dict[str, Any], orderbook_buf_len: int, pricechange_buf_len: int) -> None:
+async def heartbeat_write(runtime_state: Dict[str, Any], orderbook_buf_len: int, pricechange_buf_len: int) -> None:
     if not HEARTBEAT_ENABLED:
         return
     try:
         last_event_ts_ms = int(runtime_state.get("last_event_ts_ms") or 0)
         lag_ms = -1
         if last_event_ts_ms > 0:
-            lag_ms = int(_utc_now().timestamp() * 1000) - last_event_ts_ms
+            lag_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - last_event_ts_ms
 
         row = (
             now_msk_naive(),
@@ -1012,7 +852,7 @@ def heartbeat_write(runtime_state: Dict[str, Any], orderbook_buf_len: int, price
             "pricechange_buffer_len",
             "last_error",
         ]
-        ch_http_insert_one_row(f"{CH_DB}.{INGEST_HEARTBEAT_TABLE}", cols, row)
+        await asyncio.to_thread(ch_http_insert_json_each_row, f"{CH_DB}.{INGEST_HEARTBEAT_TABLE}", cols, [row])
     except Exception as e:
         print("[HEARTBEAT] insert error:", repr(e))
 
@@ -1021,8 +861,12 @@ def ensure_tables() -> None:
     # ClickHouse 18.x on this server has limited timezone DB support.
     # For stable MSK display we materialize as UTC+3 seconds shift.
     msk_expr = "toDateTime(intDiv(event_ts_ms, 1000) + 10800)"
-    q_orderbook = f"""
-CREATE TABLE IF NOT EXISTS {CH_DB}.{ORDERBOOK_TABLE}
+    for table, sort_key in (
+        (ORDERBOOK_TABLE, "market, asset_id, event_ts_ms, side, price, hash"),
+        (PRICECHANGE_TABLE, "market, asset_id, event_ts_ms, hash, side, price"),
+    ):
+        ch_http_command(f"""
+CREATE TABLE IF NOT EXISTS {CH_DB}.{table}
 (
   ingest_time DateTime,
   market String,
@@ -1035,24 +879,8 @@ CREATE TABLE IF NOT EXISTS {CH_DB}.{ORDERBOOK_TABLE}
   size Float64
 )
 ENGINE = MergeTree
-ORDER BY (market, asset_id, event_ts_ms, side, price, hash)
-"""
-    q_pricechange = f"""
-CREATE TABLE IF NOT EXISTS {CH_DB}.{PRICECHANGE_TABLE}
-(
-  ingest_time DateTime,
-  market String,
-  asset_id String,
-  event_ts_ms UInt64,
-  event_time_msk DateTime MATERIALIZED {msk_expr},
-  hash String,
-  side String,
-  price Float64,
-  size Float64
-)
-ENGINE = MergeTree
-ORDER BY (market, asset_id, event_ts_ms, hash, side, price)
-"""
+ORDER BY ({sort_key})
+""")
     q_heartbeat = f"""
 CREATE TABLE IF NOT EXISTS {CH_DB}.{INGEST_HEARTBEAT_TABLE}
 (
@@ -1090,42 +918,10 @@ CREATE TABLE IF NOT EXISTS {CH_DB}.{INGEST_SERVICE_LOG_TABLE}
 ENGINE = MergeTree
 ORDER BY (service, ts, event)
 """
-    ch_http_command(q_orderbook)
-    ch_http_command(q_pricechange)
-    ch_http_command(q_heartbeat)
-    ch_http_command(q_service_log)
-    # Drop legacy columns if table existed from previous version.
-    try:
-        ch_http_command(f"ALTER TABLE {CH_DB}.{PRICECHANGE_TABLE} DROP COLUMN best_bid")
-    except Exception:
-        pass
-    try:
-        ch_http_command(f"ALTER TABLE {CH_DB}.{PRICECHANGE_TABLE} DROP COLUMN best_ask")
-    except Exception:
-        pass
-    # Recreate materialized event_time_msk with stable UTC+3 conversion.
-    try:
-        ch_http_command(f"ALTER TABLE {CH_DB}.{ORDERBOOK_TABLE} DROP COLUMN event_time_msk")
-    except Exception:
-        pass
-    try:
-        ch_http_command(
-            f"ALTER TABLE {CH_DB}.{ORDERBOOK_TABLE} "
-            f"ADD COLUMN event_time_msk DateTime MATERIALIZED {msk_expr}"
-        )
-    except Exception:
-        pass
-    try:
-        ch_http_command(f"ALTER TABLE {CH_DB}.{PRICECHANGE_TABLE} DROP COLUMN event_time_msk")
-    except Exception:
-        pass
-    try:
-        ch_http_command(
-            f"ALTER TABLE {CH_DB}.{PRICECHANGE_TABLE} "
-            f"ADD COLUMN event_time_msk DateTime MATERIALIZED {msk_expr}"
-        )
-    except Exception:
-        pass
+    if HEARTBEAT_ENABLED:
+        ch_http_command(q_heartbeat)
+    if SERVICE_LOG_ENABLED:
+        ch_http_command(q_service_log)
 
 
 # -------------------- WS --------------------
@@ -1145,7 +941,7 @@ async def heartbeat_loop(
                 async with lock:
                     ob_len = len(orderbook_buf)
                     pc_len = len(pricechange_buf)
-                heartbeat_write(runtime_state, ob_len, pc_len)
+                await heartbeat_write(runtime_state, ob_len, pc_len)
         except Exception as e:
             print("[HEARTBEAT] loop error:", repr(e))
         await asyncio.sleep(max(1.0, HEARTBEAT_EVERY_SEC))
@@ -1175,78 +971,32 @@ async def flusher_loop(
             pricechange_buf.clear()
             flush_event.clear()
 
-        failed_ob: List[Tuple] = []
-        failed_pc: List[Tuple] = []
-
-        if ob:
+        cols = ["ingest_time", "market", "asset_id", "event_ts_ms", "hash", "side", "price", "size"]
+        for table, event_name, rows, buffer in (
+            (ORDERBOOK_TABLE, "orderbook", ob, orderbook_buf),
+            (PRICECHANGE_TABLE, "pricechange", pc, pricechange_buf),
+        ):
+            if not rows:
+                continue
             try:
-                cols = ["ingest_time", "market", "asset_id", "event_ts_ms", "hash", "side", "price", "size"]
-                ch_http_insert_json_each_row(f"{CH_DB}.{ORDERBOOK_TABLE}", cols, ob)
-                markets_n = len({str(row[1]) for row in ob})
-                assets_n = len({str(row[2]) for row in ob})
-                print(f"CH inserted {ORDERBOOK_TABLE}: {len(ob)} rows markets={markets_n} assets={assets_n}")
+                await asyncio.to_thread(ch_http_insert_json_each_row, f"{CH_DB}.{table}", cols, rows)
+                print(f"CH inserted {table}: {len(rows)} rows")
                 if SERVICE_LOG_FLUSH_SUCCESS:
-                    service_log(
-                        "INFO",
-                        "flush_orderbook_ok",
+                    await service_log(
+                        "INFO", f"flush_{event_name}_ok",
                         status=str(runtime_state.get("status") or ""),
-                        details={"rows": len(ob)},
+                        details={"rows": len(rows)},
                     )
             except Exception as e:
-                failed_ob = ob
-                print(f"CH INSERT ERROR {ORDERBOOK_TABLE}:", repr(e))
+                async with lock:
+                    buffer[:0] = rows
+                print(f"CH INSERT ERROR {table}:", repr(e))
                 runtime_state["last_error"] = repr(e)
                 runtime_state["status"] = "ch_insert_error"
-                service_log(
-                    "ERROR",
-                    "flush_orderbook_error",
-                    status="ch_insert_error",
-                    error_text=repr(e),
-                    details={"rows": len(ob)},
+                await service_log(
+                    "ERROR", f"flush_{event_name}_error", status="ch_insert_error",
+                    error_text=repr(e), details={"rows": len(rows)},
                 )
-
-        if pc:
-            try:
-                cols = [
-                    "ingest_time",
-                    "market",
-                    "asset_id",
-                    "event_ts_ms",
-                    "hash",
-                    "side",
-                    "price",
-                    "size",
-                ]
-                ch_http_insert_json_each_row(f"{CH_DB}.{PRICECHANGE_TABLE}", cols, pc)
-                markets_n = len({str(row[1]) for row in pc})
-                assets_n = len({str(row[2]) for row in pc})
-                print(f"CH inserted {PRICECHANGE_TABLE}: {len(pc)} rows markets={markets_n} assets={assets_n}")
-                if SERVICE_LOG_FLUSH_SUCCESS:
-                    service_log(
-                        "INFO",
-                        "flush_pricechange_ok",
-                        status=str(runtime_state.get("status") or ""),
-                        details={"rows": len(pc)},
-                    )
-            except Exception as e:
-                failed_pc = pc
-                print(f"CH INSERT ERROR {PRICECHANGE_TABLE}:", repr(e))
-                runtime_state["last_error"] = repr(e)
-                runtime_state["status"] = "ch_insert_error"
-                service_log(
-                    "ERROR",
-                    "flush_pricechange_error",
-                    status="ch_insert_error",
-                    error_text=repr(e),
-                    details={"rows": len(pc)},
-                )
-
-        if failed_ob or failed_pc:
-            async with lock:
-                if failed_ob:
-                    orderbook_buf[:0] = failed_ob
-                if failed_pc:
-                    pricechange_buf[:0] = failed_pc
 
 
 async def ingest_forever() -> None:
@@ -1257,7 +1007,7 @@ async def ingest_forever() -> None:
     flush_event = asyncio.Event()
     reload_event = asyncio.Event()
 
-    # First full book snapshot saved once per (market, asset_id)
+    # Each connection starts from a fresh baseline after any missed events.
     initial_snapshot_written: Set[str] = set()
     # Last known absolute size per (market, asset_id, side, price_tick),
     # used to convert price_change stream into delta(size).
@@ -1275,7 +1025,7 @@ async def ingest_forever() -> None:
     }
 
     # Initial discovery before first subscribe
-    markets = fetch_filtered_markets()
+    markets = await asyncio.to_thread(fetch_filtered_markets)
     asset_ids, outcome_map = build_outcome_map(markets)
     global CURRENT_ASSET_IDS, OUTCOME_MAP
     CURRENT_ASSET_IDS = asset_ids
@@ -1287,8 +1037,8 @@ async def ingest_forever() -> None:
         runtime_state["current_market_end_ts"] = _market_end_ts(markets[0]) or 0
     runtime_state["current_asset_id"] = _pick_first_up_asset_id(asset_ids, outcome_map)
 
-    ensure_tables()
-    service_log(
+    await asyncio.to_thread(ensure_tables)
+    await service_log(
         "INFO",
         "startup",
         status="starting",
@@ -1313,142 +1063,150 @@ async def ingest_forever() -> None:
         for sample in dbg["samples"]:
             print(f"[INIT] sample symbols={sample['symbols']} {sample['label']}")
 
-    asyncio.create_task(refresh_markets_loop(reload_event, runtime_state))
-    asyncio.create_task(flusher_loop(orderbook_buf, pricechange_buf, lock, flush_event, runtime_state))
-    asyncio.create_task(heartbeat_loop(runtime_state, orderbook_buf, pricechange_buf, lock))
+    background_tasks = [
+        asyncio.create_task(refresh_markets_loop(reload_event, runtime_state)),
+        asyncio.create_task(flusher_loop(orderbook_buf, pricechange_buf, lock, flush_event, runtime_state)),
+        asyncio.create_task(heartbeat_loop(runtime_state, orderbook_buf, pricechange_buf, lock)),
+    ]
+    try:
+        backoff = 1.0
+        while True:
+            try:
+                runtime_state["status"] = "connecting"
+                async with websockets.connect(
+                    WS_URL,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    open_timeout=15,
+                    max_size=10 * 1024 * 1024,
+                    origin=ORIGIN,
+                ) as ws:
+                    print("WS connected")
+                    runtime_state["status"] = "connected"
+                    runtime_state["last_error"] = ""
+                    await service_log(
+                        "INFO",
+                        "ws_connected",
+                        status="connected",
+                        market=str(runtime_state.get("current_market") or ""),
+                        asset_id=str(runtime_state.get("current_asset_id") or ""),
+                        details={"assets_ids": len(CURRENT_ASSET_IDS)},
+                    )
+                    reload_event.clear()
+                    initial_snapshot_written.clear()
+                    pricechange_level_state.clear()
+                    await ws_subscribe(ws)
+                    print("WS subscribed")
+                    runtime_state["status"] = "subscribed"
+                    runtime_state["subscribed_assets"] = len(CURRENT_ASSET_IDS)
+                    await service_log(
+                        "INFO",
+                        "ws_subscribed",
+                        status="subscribed",
+                        market=str(runtime_state.get("current_market") or ""),
+                        asset_id=str(runtime_state.get("current_asset_id") or ""),
+                        details={"assets_ids": len(CURRENT_ASSET_IDS)},
+                    )
+                    async for message in websocket_messages(ws, ping_every=10.0, stop_event=reload_event):
+                        runtime_state["last_ws_msg_time_msk"] = now_msk_naive().strftime("%Y-%m-%d %H:%M:%S")
+                        if reload_event.is_set():
+                            print("[WS] reload requested; reconnecting...")
+                            runtime_state["status"] = "reload_reconnect"
+                            await service_log(
+                                "INFO",
+                                "ws_reload_requested",
+                                status="reload_reconnect",
+                                market=str(runtime_state.get("current_market") or ""),
+                                asset_id=str(runtime_state.get("current_asset_id") or ""),
+                            )
+                            break
 
-    backoff = 1.0
-    while True:
-        try:
-            runtime_state["status"] = "connecting"
-            async with websockets.connect(
-                WS_URL,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
-                open_timeout=15,
-                max_size=10 * 1024 * 1024,
-                origin=ORIGIN,
-            ) as ws:
-                print("WS connected")
-                runtime_state["status"] = "connected"
-                runtime_state["last_error"] = ""
-                service_log(
-                    "INFO",
-                    "ws_connected",
-                    status="connected",
+                        if DEBUG_RAW:
+                            print("RAW:", message[:400])
+
+                        try:
+                            raw = json.loads(message)
+                        except Exception:
+                            continue
+
+                        for msg in normalize_messages(raw):
+                            msg_ts = to_int(msg.get("timestamp"))
+                            if msg_ts > 0:
+                                runtime_state["last_event_ts_ms"] = msg_ts
+                            if is_orderbook(msg):
+                                market = str(msg.get("market", ""))
+                                asset_id = str(msg.get("asset_id", ""))
+                                if not is_up_asset(asset_id):
+                                    continue
+
+                                snapshot_key = f"{market}|{asset_id}"
+                                if snapshot_key in initial_snapshot_written:
+                                    continue
+
+                                bid_sizes_by_tick, ask_sizes_by_tick = extract_book_level_sizes(msg)
+                                rows = build_orderbook_rows_from_initial_book(msg, bid_sizes_by_tick, ask_sizes_by_tick)
+                                if rows:
+                                    initial_snapshot_written.add(snapshot_key)
+                                    runtime_state["current_market"] = market or str(runtime_state.get("current_market") or "")
+                                    runtime_state["current_asset_id"] = asset_id or str(runtime_state.get("current_asset_id") or "")
+                                    # Seed pricechange state with absolute sizes from initial book,
+                                    # so subsequent deltas are relative to this baseline.
+                                    for tick, sz in bid_sizes_by_tick.items():
+                                        if abs(sz) > 1e-12:
+                                            key = f"{market}|{asset_id}|bid|{tick}"
+                                            pricechange_level_state[key] = float(sz)
+                                    for tick, sz in ask_sizes_by_tick.items():
+                                        if abs(sz) > 1e-12:
+                                            key = f"{market}|{asset_id}|ask|{tick}"
+                                            pricechange_level_state[key] = float(sz)
+                                    async with lock:
+                                        orderbook_buf.extend(rows)
+                                        if (len(orderbook_buf) + len(pricechange_buf)) >= FLUSH_EVERY_N:
+                                            flush_event.set()
+                                    await service_log(
+                                        "INFO",
+                                        "orderbook_snapshot_written",
+                                        status=str(runtime_state.get("status") or ""),
+                                        market=market,
+                                        asset_id=asset_id,
+                                        event_ts_ms=msg_ts,
+                                        details={"rows": len(rows), "non_zero_bid": len(bid_sizes_by_tick), "non_zero_ask": len(ask_sizes_by_tick)},
+                                    )
+
+                            elif is_price_change(msg):
+                                rows = build_pricechange_rows(msg, pricechange_level_state, initial_snapshot_written)
+                                if rows:
+                                    async with lock:
+                                        pricechange_buf.extend(rows)
+                                        if (len(orderbook_buf) + len(pricechange_buf)) >= FLUSH_EVERY_N:
+                                            flush_event.set()
+
+                    backoff = 1.0
+                    runtime_state["status"] = "disconnected"
+
+            except Exception as e:
+                print("WS error:", repr(e))
+                runtime_state["status"] = "ws_error"
+                runtime_state["last_error"] = repr(e)
+                await service_log(
+                    "ERROR",
+                    "ws_error",
+                    status="ws_error",
                     market=str(runtime_state.get("current_market") or ""),
                     asset_id=str(runtime_state.get("current_asset_id") or ""),
-                    details={"assets_ids": len(CURRENT_ASSET_IDS)},
+                    error_text=repr(e),
+                    details={"backoff_sec": backoff},
                 )
-                await ws_subscribe(ws)
-                print("WS subscribed")
-                runtime_state["status"] = "subscribed"
-                runtime_state["subscribed_assets"] = len(CURRENT_ASSET_IDS)
-                service_log(
-                    "INFO",
-                    "ws_subscribed",
-                    status="subscribed",
-                    market=str(runtime_state.get("current_market") or ""),
-                    asset_id=str(runtime_state.get("current_asset_id") or ""),
-                    details={"assets_ids": len(CURRENT_ASSET_IDS)},
-                )
-                reload_event.clear()
-
-                async for message in ws:
-                    runtime_state["last_ws_msg_time_msk"] = _fmt_dt_msk(_utc_now())
-                    if reload_event.is_set():
-                        print("[WS] reload requested; reconnecting...")
-                        runtime_state["status"] = "reload_reconnect"
-                        service_log(
-                            "INFO",
-                            "ws_reload_requested",
-                            status="reload_reconnect",
-                            market=str(runtime_state.get("current_market") or ""),
-                            asset_id=str(runtime_state.get("current_asset_id") or ""),
-                        )
-                        break
-
-                    if DEBUG_RAW:
-                        print("RAW:", message[:400])
-
-                    try:
-                        raw = json.loads(message)
-                    except Exception:
-                        continue
-
-                    for msg in normalize_messages(raw):
-                        msg_ts = to_int(msg.get("timestamp"))
-                        if msg_ts > 0:
-                            runtime_state["last_event_ts_ms"] = msg_ts
-                        if is_orderbook(msg):
-                            market = str(msg.get("market", ""))
-                            asset_id = str(msg.get("asset_id", ""))
-                            if not is_up_asset(asset_id):
-                                continue
-
-                            snapshot_key = f"{market}|{asset_id}"
-                            if snapshot_key in initial_snapshot_written:
-                                continue
-
-                            bid_sizes_by_tick, ask_sizes_by_tick = extract_book_level_sizes(msg)
-                            rows = build_orderbook_rows_from_initial_book(msg, bid_sizes_by_tick, ask_sizes_by_tick)
-                            if rows:
-                                initial_snapshot_written.add(snapshot_key)
-                                runtime_state["current_market"] = market or str(runtime_state.get("current_market") or "")
-                                runtime_state["current_asset_id"] = asset_id or str(runtime_state.get("current_asset_id") or "")
-                                # Seed pricechange state with absolute sizes from initial book,
-                                # so subsequent deltas are relative to this baseline.
-                                for tick, sz in bid_sizes_by_tick.items():
-                                    if abs(sz) > 1e-12:
-                                        key = f"{market}|{asset_id}|bid|{tick}"
-                                        pricechange_level_state[key] = float(sz)
-                                for tick, sz in ask_sizes_by_tick.items():
-                                    if abs(sz) > 1e-12:
-                                        key = f"{market}|{asset_id}|ask|{tick}"
-                                        pricechange_level_state[key] = float(sz)
-                                async with lock:
-                                    orderbook_buf.extend(rows)
-                                    if (len(orderbook_buf) + len(pricechange_buf)) >= FLUSH_EVERY_N:
-                                        flush_event.set()
-                                service_log(
-                                    "INFO",
-                                    "orderbook_snapshot_written",
-                                    status=str(runtime_state.get("status") or ""),
-                                    market=market,
-                                    asset_id=asset_id,
-                                    event_ts_ms=msg_ts,
-                                    details={"rows": len(rows), "non_zero_bid": len(bid_sizes_by_tick), "non_zero_ask": len(ask_sizes_by_tick)},
-                                )
-
-                        elif is_price_change(msg):
-                            rows = build_pricechange_rows(msg, pricechange_level_state, initial_snapshot_written)
-                            if rows:
-                                async with lock:
-                                    pricechange_buf.extend(rows)
-                                    if (len(orderbook_buf) + len(pricechange_buf)) >= FLUSH_EVERY_N:
-                                        flush_event.set()
-
-                backoff = 1.0
-                runtime_state["status"] = "disconnected"
-
-        except Exception as e:
-            print("WS error:", repr(e))
-            runtime_state["status"] = "ws_error"
-            runtime_state["last_error"] = repr(e)
-            service_log(
-                "ERROR",
-                "ws_error",
-                status="ws_error",
-                market=str(runtime_state.get("current_market") or ""),
-                asset_id=str(runtime_state.get("current_asset_id") or ""),
-                error_text=repr(e),
-                details={"backoff_sec": backoff},
-            )
-            await asyncio.sleep(backoff)
-            runtime_state["status"] = "reconnecting"
-            backoff = min(backoff * 2, 30.0)
+                await asyncio.sleep(backoff)
+                runtime_state["status"] = "reconnecting"
+                backoff = min(backoff * 2, 30.0)
+    finally:
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(ingest_forever())
+    from collector_v2 import main
+    raise SystemExit(main("orderbooks"))

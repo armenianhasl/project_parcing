@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Run both collectors with: python project."""
+from run_collectors import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
